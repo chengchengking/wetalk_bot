@@ -24,6 +24,10 @@ PACKAGE_NAME = "com.wetalkapp"
 LAST_CHECKIN_FILE = "last_checkin.txt"
 STATS_FILE = "stats.json"
 
+# CaptchaRun API 令牌配置（请登录 https://captcha-run.com/overview 获取令牌）
+# 支持读取环境变量 CAPTCHARUN_TOKEN，或者直接在下方填入字符串
+CAPTCHARUN_TOKEN = os.environ.get("CAPTCHARUN_TOKEN", "")
+
 # 允许的前台应用包名（在此之外的包名均视为意外跳转，自动发送返回键）
 ALLOWED_PACKAGES = [
     "com.wetalkapp",
@@ -315,6 +319,200 @@ def mark_checked_in():
     stats["checked_in"] = True
     save_stats()
 
+def find_node_by_class(node, class_name):
+    """递归查找指定类名的节点"""
+    if node.get("class") == class_name:
+        return node
+    for child in node:
+        res = find_node_by_class(child, class_name)
+        if res is not None:
+            return res
+    return None
+
+def find_all_nodes_by_class(node, class_name, results=None):
+    """递归查找所有指定类名的节点"""
+    if results is None:
+        results = []
+    if node.get("class") == class_name:
+        results.append(node)
+    for child in node:
+        find_all_nodes_by_class(child, class_name, results)
+    return results
+
+def get_distance(p1, p2):
+    """计算两点坐标的欧氏距离平方"""
+    return (p1[0] - p2[0])**2 + (p1[1] - p2[1])**2
+
+def solve_text_captcha(image_base64):
+    """通过 CaptchaRun API 识别验证码"""
+    if not CAPTCHARUN_TOKEN:
+        log("⚠️ 未配置 CAPTCHARUN_TOKEN，跳过自动识别")
+        return None
+        
+    url = "https://api.captcha-run.com/v2/tasks"
+    headers = {
+        "Authorization": f"Bearer {CAPTCHARUN_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "captchaType": "TextCaptcha",
+        "image": image_base64
+    }
+    
+    try:
+        import requests
+        log("📨 正在发送验证码图片至 CaptchaRun API...")
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code == 200:
+            res_data = response.json()
+            result = res_data.get("result", {})
+            if result.get("status") == "Success":
+                return result.get("text")
+            else:
+                log(f"❌ CaptchaRun 识别失败，状态: {result.get('status')}")
+        else:
+            log(f"❌ CaptchaRun 请求失败，状态码: {response.status_code}, 内容: {response.text}")
+    except Exception as e:
+        log(f"❌ 请求 CaptchaRun 出现异常: {e}")
+    return None
+
+def handle_captcha_if_present(root):
+    """检测并自动识别处理验证码弹窗"""
+    # WeTalk 验证码弹窗中必然会有一个输入框 (EditText)
+    edit_node = find_node_by_class(root, "android.widget.EditText")
+    if edit_node is None:
+        return False
+        
+    log("🔍 检测到输入框 (可能存在验证码弹窗)！")
+    
+    if not CAPTCHARUN_TOKEN:
+        log("⚠️ 请在 bot.py 顶部配置 CAPTCHARUN_TOKEN 以启用验证码自动识别！")
+        time.sleep(5.0)
+        return True  # 视为检测到验证码，防止主循环执行其他错误点击
+        
+    # 查找所有的 ImageView，选出离输入框最近的那个作为验证码图片
+    img_nodes = find_all_nodes_by_class(root, "android.widget.ImageView")
+    if not img_nodes:
+        log("⚠️ 未找到任何图片节点，无法提取验证码")
+        return True
+        
+    edit_center = get_center_coord(edit_node.get("bounds"))
+    if not edit_center:
+        return True
+        
+    # 过滤掉位置不合理或尺寸过大过小的图片
+    valid_imgs = []
+    for img in img_nodes:
+        bounds = parse_bounds(img.get("bounds"))
+        if bounds:
+            x1, y1, x2, y2 = bounds
+            w, h = x2 - x1, y2 - y1
+            if w > 30 and h > 30 and y1 > 200 and y2 < 2900:
+                valid_imgs.append(img)
+                
+    if not valid_imgs:
+        log("⚠️ 未找到合适的验证码图片节点")
+        return True
+        
+    # 找到最近的 ImageView
+    closest_img = None
+    min_dist = float("inf")
+    for img in valid_imgs:
+        img_center = get_center_coord(img.get("bounds"))
+        if img_center:
+            dist = get_distance(edit_center, img_center)
+            if dist < min_dist:
+                min_dist = dist
+                closest_img = img
+                
+    if not closest_img:
+        log("⚠️ 无法定位验证码图片")
+        return True
+        
+    img_bounds = parse_bounds(closest_img.get("bounds"))
+    log(f"📸 选定验证码图片节点: bounds={img_bounds}")
+    
+    # 1. 截图并拉取
+    screenshot_file = "captcha_screenshot.png"
+    run_adb(["shell", "screencap", "-p", "/sdcard/captcha_screen.png"])
+    run_adb(["pull", "/sdcard/captcha_screen.png", screenshot_file])
+    
+    if not os.path.exists(screenshot_file):
+        log("❌ 截图拉取失败，无法识别")
+        return True
+        
+    # 2. 裁剪图片
+    cropped_file = "captcha_cropped.png"
+    try:
+        from PIL import Image
+        img = Image.open(screenshot_file)
+        x1, y1, x2, y2 = img_bounds
+        cropped = img.crop((x1, y1, x2, y2))
+        cropped.save(cropped_file)
+        log("💾 验证码图片裁剪成功")
+    except Exception as e:
+        log(f"❌ 裁剪验证码图片失败: {e}")
+        if os.path.exists(screenshot_file):
+            os.remove(screenshot_file)
+        return True
+        
+    # 3. 转 Base64
+    import base64
+    try:
+        with open(cropped_file, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        log(f"❌ 读取裁剪图片失败: {e}")
+        return True
+    finally:
+        if os.path.exists(screenshot_file):
+            os.remove(screenshot_file)
+        if os.path.exists(cropped_file):
+            os.remove(cropped_file)
+            
+    # 4. 提交识别
+    solved_text = solve_text_captcha(encoded_string)
+    if not solved_text:
+        log("❌ 验证码识别失败，点击验证码图片以刷新...")
+        img_center = get_center_coord(closest_img.get("bounds"))
+        if img_center:
+            tap_coord(img_center[0], img_center[1])
+        time.sleep(2.0)
+        return True
+        
+    log(f"🎉 CaptchaRun 识别成功！验证码: {solved_text}，正在输入并提交...")
+    
+    # 5. 聚焦输入框并清除旧文本
+    tap_coord(edit_center[0], edit_center[1])
+    time.sleep(0.5)
+    # 发送退格键清空
+    for _ in range(8):
+        run_adb(["shell", "input", "keyevent", "67"])
+        
+    run_adb(["shell", "input", "text", solved_text])
+    time.sleep(1.0)
+    
+    # 6. 查找确认/提交按钮
+    submit_btn = None
+    for kw in ["确定", "提交", "OK", "确认"]:
+        submit_btn = find_node_by_text(root, kw)
+        if submit_btn is None:
+            submit_btn = find_node_by_text_contains(root, kw)
+        if submit_btn is not None:
+            break
+            
+    if submit_btn is not None:
+        submit_center = get_center_coord(submit_btn.get("bounds"))
+        if submit_center:
+            log(f"👉 点击提交按钮: bounds={submit_btn.get('bounds')}")
+            tap_coord(submit_center[0], submit_center[1])
+    else:
+        log("👉 未找到显式提交按钮，执行坐标兜底点击（输入框下方 150px）")
+        tap_coord(edit_center[0], edit_center[1] + 150)
+        
+    time.sleep(3.0)
+    return True
+
 def main():
     load_stats()
     
@@ -360,6 +558,10 @@ def main():
             root = dump_ui()
             if root is None:
                 time.sleep(2)
+                continue
+            
+            # 4.5 优先检测并自动识别处理验证码弹窗
+            if handle_captcha_if_present(root):
                 continue
             
             # 5. 分析主界面与弹窗状态
