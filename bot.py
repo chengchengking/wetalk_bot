@@ -376,24 +376,48 @@ def solve_text_captcha(image_base64):
         log(f"❌ 请求 CaptchaRun 出现异常: {e}")
     return None
 
+captcha_retries = 0
+last_captcha_warn_time = 0
+
 def handle_captcha_if_present(root):
     """检测并自动识别处理验证码弹窗"""
+    global captcha_retries, last_captcha_warn_time
+    
     # WeTalk 验证码弹窗中必然会有一个输入框 (EditText)
     edit_node = find_node_by_class(root, "android.widget.EditText")
     if edit_node is None:
+        # 重置验证码尝试计数，因为弹窗已经关闭了
+        captcha_retries = 0
         return False
         
-    log("🔍 检测到输入框 (可能存在验证码弹窗)！")
+    current_time = time.time()
     
+    # 场景一：用户未配置 Token，提示在手机上手动输入
     if not CAPTCHARUN_TOKEN:
-        log("⚠️ 请在 bot.py 顶部配置 CAPTCHARUN_TOKEN 以启用验证码自动识别！")
-        time.sleep(5.0)
-        return True  # 视为检测到验证码，防止主循环执行其他错误点击
+        # 每 10 秒提示一次，避免日志刷屏
+        if current_time - last_captcha_warn_time > 10:
+            log("🚨 [手动输入提示] 检测到验证码弹窗！当前未配置 CAPTCHARUN_TOKEN。")
+            log("👉 请在手机上【手动输入验证码并提交】。脚本已暂停点击，将在您完成后自动恢复挂机...")
+            last_captcha_warn_time = current_time
+        time.sleep(3.0)
+        return True  # 视为已处理本轮，阻止主循环执行其他冲突的点击
         
+    # 场景二：如果配置了 Token，但识别连续失败次数过多（超过 3 次），则降级为手动输入，防止频繁扣费或死循环
+    if captcha_retries >= 3:
+        if current_time - last_captcha_warn_time > 10:
+            log("🚨 [手动输入提示] 验证码自动识别已连续失败 3 次。为防止持续出错，已降级为手动模式。")
+            log("👉 请在手机上【手动输入验证码并提交】。输入完成后脚本会自动恢复...")
+            last_captcha_warn_time = current_time
+        time.sleep(3.0)
+        return True
+        
+    log(f"🔍 检测到验证码弹窗！启动自动识别 (第 {captcha_retries + 1}/3 次尝试)...")
+    
     # 查找所有的 ImageView，选出离输入框最近的那个作为验证码图片
     img_nodes = find_all_nodes_by_class(root, "android.widget.ImageView")
     if not img_nodes:
-        log("⚠️ 未找到任何图片节点，无法提取验证码")
+        log("⚠️ 未找到任何图片节点，无法提取验证码，转为等待用户手动处理...")
+        time.sleep(3.0)
         return True
         
     edit_center = get_center_coord(edit_node.get("bounds"))
@@ -411,7 +435,8 @@ def handle_captcha_if_present(root):
                 valid_imgs.append(img)
                 
     if not valid_imgs:
-        log("⚠️ 未找到合适的验证码图片节点")
+        log("⚠️ 未找到合适的验证码图片节点，转为等待用户手动处理...")
+        time.sleep(3.0)
         return True
         
     # 找到最近的 ImageView
@@ -426,7 +451,8 @@ def handle_captcha_if_present(root):
                 closest_img = img
                 
     if not closest_img:
-        log("⚠️ 无法定位验证码图片")
+        log("⚠️ 无法定位验证码图片，转为等待用户手动处理...")
+        time.sleep(3.0)
         return True
         
     img_bounds = parse_bounds(closest_img.get("bounds"))
@@ -438,7 +464,8 @@ def handle_captcha_if_present(root):
     run_adb(["pull", "/sdcard/captcha_screen.png", screenshot_file])
     
     if not os.path.exists(screenshot_file):
-        log("❌ 截图拉取失败，无法识别")
+        log("❌ 截图拉取失败，无法识别，转为等待用户手动处理...")
+        time.sleep(3.0)
         return True
         
     # 2. 裁剪图片
@@ -451,9 +478,10 @@ def handle_captcha_if_present(root):
         cropped.save(cropped_file)
         log("💾 验证码图片裁剪成功")
     except Exception as e:
-        log(f"❌ 裁剪验证码图片失败: {e}")
+        log(f"❌ 裁剪验证码图片失败: {e}，转为等待用户手动处理...")
         if os.path.exists(screenshot_file):
             os.remove(screenshot_file)
+        time.sleep(3.0)
         return True
         
     # 3. 转 Base64
@@ -470,6 +498,9 @@ def handle_captcha_if_present(root):
         if os.path.exists(cropped_file):
             os.remove(cropped_file)
             
+    # 增加尝试次数计数
+    captcha_retries += 1
+            
     # 4. 提交识别
     solved_text = solve_text_captcha(encoded_string)
     if not solved_text:
@@ -477,10 +508,10 @@ def handle_captcha_if_present(root):
         img_center = get_center_coord(closest_img.get("bounds"))
         if img_center:
             tap_coord(img_center[0], img_center[1])
-        time.sleep(2.0)
+        time.sleep(3.0)
         return True
         
-    log(f"🎉 CaptchaRun 识别成功！验证码: {solved_text}，正在输入并提交...")
+    log(f"🎉 CaptchaRun 识别成功！结果: {solved_text}，正在输入并提交...")
     
     # 5. 聚焦输入框并清除旧文本
     tap_coord(edit_center[0], edit_center[1])
@@ -510,7 +541,7 @@ def handle_captcha_if_present(root):
         log("👉 未找到显式提交按钮，执行坐标兜底点击（输入框下方 150px）")
         tap_coord(edit_center[0], edit_center[1] + 150)
         
-    time.sleep(3.0)
+    time.sleep(4.0)
     return True
 
 def main():
